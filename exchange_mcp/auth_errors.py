@@ -219,6 +219,24 @@ SIGNIN_HOST_HINTS: tuple[str, ...] = (
 )
 
 
+# Sign-in pages that only a *classic* (canary-cookie) OWA serves: Exchange's
+# own forms-based logon on the mailbox host. A page parked here can never mint
+# a modern-backend Bearer token, so BrowserSession skips the 20s bearer-capture
+# wait instead of paying it on every pre-sign-in session check. Deliberately
+# narrower than SIGNIN_HOST_HINTS: an ADFS or Entra page can front either
+# backend, so it says nothing about which one is behind it.
+CLASSIC_OWA_SIGNIN_HINTS: tuple[str, ...] = (
+    "/owa/auth/logon.aspx",
+    "/owa/auth.owa",
+)
+
+
+def looks_like_classic_owa_signin(url: str) -> bool:
+    """True if `url` is classic OWA's own forms-based sign-in page."""
+    lowered = (url or "").strip().lower()
+    return any(hint in lowered for hint in CLASSIC_OWA_SIGNIN_HINTS)
+
+
 def looks_like_signin_url(url: str) -> bool:
     """True if `url` is still part of an authentication flow.
 

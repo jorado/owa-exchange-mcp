@@ -128,6 +128,27 @@ def test_error_carries_remediation() -> None:
     check("explicit reason preserved", typed.reason == ae.ACCOUNT_LOCKED)
 
 
+def test_classic_owa_signin() -> None:
+    print("Classic OWA sign-in page detection")
+    for url in (
+        "https://owa.example.edu/owa/auth/logon.aspx?url=https%3a%2f%2fowa.example.edu%2fowa%2f&reason=0",
+        "https://OWA.example.edu/OWA/AUTH/LOGON.ASPX",
+        "https://owa.example.edu/owa/auth.owa",
+    ):
+        check(f"classic: {url[:60]}", ae.looks_like_classic_owa_signin(url))
+    # Pages that can front the modern backend must not short-circuit the
+    # bearer capture - waiting is the only way to learn a token is coming.
+    for url in (
+        "https://login.microsoftonline.com/common/oauth2/authorize",
+        "https://sts.example.edu/adfs/ls/?wa=wsignin1.0",
+        "https://outlook.office.com/mail/",
+        "https://owa.example.edu/owa/",
+        "",
+        "about:blank",
+    ):
+        check(f"not classic: {url or '<empty>'}", not ae.looks_like_classic_owa_signin(url))
+
+
 def test_default_profile_dir() -> None:
     print("Default profile directory")
     resolved = bs.default_profile_dir()
@@ -166,6 +187,7 @@ def main() -> bool:
         test_no_false_positives,
         test_remediation,
         test_error_carries_remediation,
+        test_classic_owa_signin,
         test_default_profile_dir,
     ):
         test()

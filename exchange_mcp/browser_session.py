@@ -32,6 +32,7 @@ from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
     VISIBLE_ERROR_SELECTORS,
     AuthenticationRequiredError,
     classify_login_failure,
+    looks_like_classic_owa_signin,
     looks_like_signin_url,
 )
 from exchange_mcp.profile_lock import (  # noqa: F401  (re-exported for callers)
@@ -482,6 +483,26 @@ class CopilotUnavailableError(Exception):
     """
 
 
+# fetch() run inside an OWA page, with the body read by the page's own JS and
+# handed back through evaluate(). Shared by both auth modes' request paths:
+# reading the body via CDP (page.expect_response() + response.body()) failed
+# on the modern backend ("Response body is not available...") and hung outright
+# on on-premise Exchange 2019 - see _async_execute_on_anchor / _async_execute.
+_IN_PAGE_FETCH_SCRIPT = """
+    async ([url, opts]) => {
+        try {
+            const r = await fetch(url, opts);
+            const text = await r.text();
+            const headers = {};
+            r.headers.forEach((v, k) => { headers[k] = v; });
+            return {status: r.status, headers, body: text, error: null};
+        } catch (e) {
+            return {status: 0, headers: {}, body: '', error: String(e)};
+        }
+    }
+"""
+
+
 class BrowserResponse:
     """Minimal requests.Response-like wrapper around a captured Playwright response."""
 
@@ -547,6 +568,10 @@ class BrowserSession:
         # every classic OWA deployment) and flips to "bearer" the first time
         # a request against this session comes back with no canary cookie.
         self._auth_mode = "canary"
+        # Latched the first time a canary cookie is seen: the deployment is
+        # classic, so no page of it will ever mint a Bearer token and
+        # _async_capture_bearer_context can stop paying its 20s wait to learn so.
+        self._classic_backend = False
         self._bearer: dict = {}
         self._bearer_expiry = 0.0
         self._bearer_lock: asyncio.Lock | None = None
@@ -755,7 +780,10 @@ class BrowserSession:
 
     async def _async_is_session_valid(self) -> bool:
         cookies = await self._context.cookies()
-        return any(c["name"] == "X-OWA-CANARY" for c in cookies)
+        valid = any(c["name"] == "X-OWA-CANARY" for c in cookies)
+        if valid:
+            self._classic_backend = True
+        return valid
 
     async def _async_has_active_session(self) -> bool:
         """True if the anchor page is already authenticated, in either auth mode.
@@ -1117,6 +1145,7 @@ class BrowserSession:
         cookies = await self._context.cookies()
         for c in cookies:
             if c["name"] == "X-OWA-CANARY":
+                self._classic_backend = True
                 return c["value"]
         return ""
 
@@ -1137,6 +1166,16 @@ class BrowserSession:
         service.svc calls, which we intercept and read the headers off of.
         """
         page = self._anchor_page
+        # Classic OWA never mints a token, so waiting for one only costs time:
+        # measured 20s per pre-sign-in session check (41s for a check_session
+        # that retried) on an on-premise Exchange 2019 with no session yet.
+        try:
+            on_classic_signin = looks_like_classic_owa_signin(page.url)
+        except Exception:
+            on_classic_signin = False
+        if self._classic_backend or on_classic_signin:
+            return False
+
         loop = asyncio.get_event_loop()
         found: asyncio.Future = loop.create_future()
 
@@ -1259,20 +1298,7 @@ class BrowserSession:
         fetch_opts = {"method": "POST", "headers": headers, "credentials": "include"}
         if body is not None:
             fetch_opts["body"] = body
-
-        script = """
-            async ([url, opts]) => {
-                try {
-                    const r = await fetch(url, opts);
-                    const text = await r.text();
-                    const headers = {};
-                    r.headers.forEach((v, k) => { headers[k] = v; });
-                    return {status: r.status, headers, body: text, error: null};
-                } catch (e) {
-                    return {status: 0, headers: {}, body: '', error: String(e)};
-                }
-            }
-            """
+        script = _IN_PAGE_FETCH_SCRIPT
 
         # The modern Outlook SPA can navigate itself internally (route
         # changes with no visible URL/reload) at any point, not just right
@@ -1304,32 +1330,37 @@ class BrowserSession:
             result["status"], result["headers"], result["body"].encode("utf-8")
         )
 
-    async def _async_execute(self, url: str, headers: dict, body: str | None, match_hint: str, timeout: float) -> BrowserResponse:
-        page = await self._context.new_page()
+    async def _async_execute(self, url: str, headers: dict, body: str | None, timeout: float) -> BrowserResponse:
+        """Classic canary-cookie request, fired from the anchor page like bearer mode.
+
+        This used to open a fresh tab per request, load the whole OWA app into
+        it, fetch once and close it - and read the body via
+        page.expect_response() + response.body(). Both were costly on an
+        on-premise Exchange 2019 OWA (15.2): the CDP body read never returned at
+        all (not even at expect_response's own timeout) while the same fetch()
+        answered 200 in well under a second when read in-page, so every request
+        died on _run()'s outer budget as an empty-str() TimeoutError; and once
+        that was fixed, a tab popping up (and taking focus) per request made a
+        visible post-login window unusable and every tool call slow.
+
+        The only thing the classic fetch needs from its page is the OWA origin,
+        so the cookies (and the canary we copy into the header) go along. The
+        anchor page is moved there once if it isn't already; after that requests
+        cost one fetch() each.
+        """
+        page = self._anchor_page
         try:
+            on_owa = urlparse(page.url).netloc == self.owa_host
+        except Exception:
+            on_owa = False
+        if not on_owa:
             try:
+                # domcontentloaded, not networkidle: classic OWA keeps a
+                # notification long-poll open, so networkidle can just time out.
                 await page.goto(f"{self.owa_url}/owa/", wait_until="domcontentloaded", timeout=timeout * 1000)
             except Exception:
                 pass
-
-            fetch_opts = {"method": "POST", "headers": headers, "credentials": "same-origin"}
-            if body is not None:
-                fetch_opts["body"] = body
-
-            async with page.expect_response(
-                lambda r: match_hint in r.url, timeout=timeout * 1000
-            ) as resp_info:
-                await page.evaluate(
-                    "([url, opts]) => fetch(url, opts).then(r => r.status).catch(() => -1)",
-                    [url, fetch_opts],
-                )
-            response = await resp_info.value
-            status = response.status
-            resp_headers = await response.all_headers()
-            content = await response.body()
-            return BrowserResponse(status, resp_headers, content)
-        finally:
-            await page.close()
+        return await self._async_execute_on_anchor(url, headers, body, timeout)
 
     async def _async_post_json(self, action: str, payload: dict, timeout: float) -> BrowserResponse:
         await self._async_ensure_context()
@@ -1349,7 +1380,7 @@ class BrowserSession:
             "X-OWA-CANARY": canary,
             "X-Requested-With": "XMLHttpRequest",
         }
-        return await self._async_execute(url, headers, body, f"action={action}", timeout)
+        return await self._async_execute(url, headers, body, timeout)
 
     async def _async_post_header_payload(self, action: str, payload: dict, timeout: float) -> BrowserResponse:
         await self._async_ensure_context()
@@ -1371,7 +1402,7 @@ class BrowserSession:
             "X-OWA-UrlPostData": url_post_data,
             "X-Requested-With": "XMLHttpRequest",
         }
-        return await self._async_execute(url, headers, None, f"action={action}", timeout)
+        return await self._async_execute(url, headers, None, timeout)
 
     def post_json(self, action: str, payload: dict, timeout: float = 30) -> BrowserResponse:
         return self._run_with_recovery(
