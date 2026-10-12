@@ -14,8 +14,9 @@ Pure logic, no Playwright: takes the `MCPServer` as a parameter, like
 Besides tool names, a selection may name a **preset** (`PRESETS`), which
 expands to its tools and can be combined with further names
 (`read-drafts,send_email`), or `all`, which turns the filter off. When nothing
-is configured, `DEFAULT_SELECTION` applies - `all` here, so an unconfigured
-server behaves exactly as it did before this module existed.
+is configured, `DEFAULT_SELECTION` applies - `read-drafts` in this fork, so an
+unconfigured server can read and draft but never send; `all` restores every
+tool.
 
 Two rules are load-bearing:
 
@@ -60,7 +61,7 @@ PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 # What applies when EXCHANGE_MCP_TOOLS / --tools is unset or blank.
-DEFAULT_SELECTION = ALL
+DEFAULT_SELECTION = "read-drafts"
 
 
 def parse_tool_allowlist(raw: str | None) -> frozenset[str] | None:
