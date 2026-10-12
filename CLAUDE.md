@@ -17,6 +17,7 @@ The server requires one environment variable, plus optional ones for the browser
 - `EXCHANGE_MCP_TRANSPORT` — (optional) `stdio` (default) or `http`. Same effect as `--transport`.
 - `EXCHANGE_MCP_HOST` / `EXCHANGE_MCP_PORT` — (optional) Bind address for `--transport http`. Default `127.0.0.1:8765` — never bind non-loopback, the MCP endpoint has no auth of its own.
 - `EXCHANGE_MCP_STABLE` — (optional) Set to `true`/`1`/`yes` to exclude known-buggy tools (`KNOWN_BUGGY_TOOLS` in `server.py`, kept in sync with the KO rows / Stability column in PROJECT_STATUS.md) from the MCP tool listing at startup, instead of exposing them to fail at call time. Same effect as the `--stable` CLI flag.
+- `EXCHANGE_MCP_TOOLS` — (optional) Comma-separated tool names and/or presets (`tool_selection.PRESETS`, e.g. `read-drafts`), or `all`; every other tool is removed from the MCP listing at startup (`tool_selection.py`), and `dev_reload_tool_modules` re-applies it after a reload. Same effect as `--tools`. Unset or blank applies `tool_selection.DEFAULT_SELECTION` (`all`) — never "nothing". The smoke harness always passes `--tools all`. Names matching no tool are logged as a typo warning, and leaving out `login`/`check_session` is warned about too. Exists so one deployment can mean "read mail + calendar, write drafts, never send" (`create_draft`/`create_reply_draft` are `SaveOnly` by construction) for every client at once, instead of per-client tool filters that the next client connected silently lacks.
 - `EXCHANGE_MCP_DEV_RELOAD` — (optional) Set to `true`/`1`/`yes` to register `dev_reload_tool_modules`, letting a client re-import `exchange_mcp/tools/*.py` on a running `--transport http` server without restarting it — see "Hot reload" below. Same effect as the `--dev-reload` CLI flag. Off by default: dev-only, never for a shared prod instance.
 - `EXCHANGE_TIMEZONE` — (optional) The mailbox's own timezone, as a Windows id (`W. Europe Standard Time`) or an IANA one (`Europe/Rome`). **One variable, two consumers, same meaning**: the `TimeZoneContext` every request carries (`mailbox_timezone.py`, issue #8) and the local working-hours grid UTC busy periods are placed on (`availability_frame.py`, #601/#602). Unset — which is the normal case — the zone is read from the mailbox's own OWA configuration once per process; this overrides that, for when the lookup gets it wrong or the server rejects what it returned. The two consumers degrade differently and both say which applied: writes fall back to `UTC` (never a regional zone, see "Timezone" below), while the availability grid falls back to not shifting at all and reports that in the tool's own output. An IANA id always resolves for the grid, so it is also the escape hatch for a Windows id `availability_frame`'s table doesn't know.
 - `EXCHANGE_DISCOVERY_DIR` — (optional) Where capability-discovery captures are written. Default comes from `discovery_session.default_discovery_dir()` and mirrors the profile-dir split: `<repo>/.discovery-sessions` in a source checkout, `~/owa-mcp/discovery-sessions` for an installed package. Gitignored — a capture holds real mailbox metadata (see "Capability discovery" below).
@@ -27,7 +28,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 
 ## Structure
 
-- `exchange_mcp/` — MCP server package (63 tools)
+- `exchange_mcp/` — MCP server package (65 tools)
   - `server.py` — `MCPServer` (mcp SDK v2) with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
@@ -39,6 +40,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `discovery_session.py` — `DiscoveryRecorder`: a *second*, independent Chromium on a throwaway profile, visible and driven by the user, recording every API call and UI action. Shares nothing with `BrowserSession` but the OWA URL — see "Capability discovery" below.
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
+  - `tool_selection.py` — The `EXCHANGE_MCP_TOOLS` allowlist: presets, the default selection, parsing, applying it to a live `MCPServer`, and the typo / missing-sign-in diagnosis for the startup log. No Playwright, unit-testable.
   - `hot_reload.py` — Re-registers one or more `tools/*.py` modules' `@mcp.tool()` functions on a live `MCPServer` without a process restart. Takes the `MCPServer` instance as a parameter rather than importing `server.py` (which owns `mcp` and would create an import cycle). No Playwright, unit-testable — see "Hot reload" below.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
 - `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed. Run them all with `python -m tests.unit` (`tests/unit/__main__.py` **discovers** every `test_*.py` and calls its `main()`, so a new suite is picked up with no list to update — that's what CI runs), or one at a time as `python -m tests.unit.<suite>`. Every suite must expose `main() -> bool`; one that doesn't is reported as a failure, not skipped. Separate from `tests/smoke/`, which is live-mailbox end-to-end and can't run unattended.
@@ -55,6 +57,7 @@ pip install -e .               # Install MCP server
 exchange-mcp-server            # Run MCP server (stdio transport, spawned per client session)
 exchange-mcp-server --show-browser  # Same, with a visible browser window
 exchange-mcp-server --stable        # Same, excluding known-buggy tools from the MCP tool listing
+exchange-mcp-server --tools read-drafts  # Same, exposing only a preset (or a list of tool names)
 exchange-mcp-server --transport http --dev-reload  # Same, plus dev_reload_tool_modules (see "Hot reload" below)
 
 # Persistent local server instead of per-session stdio spawn (start manually,
@@ -93,6 +96,8 @@ python -m tests.unit.test_substrate_search_mapping
 python -m tests.unit.test_hot_reload
 python -m tests.unit.test_substrate_search_retry
 python -m tests.unit.test_triage_emails
+python -m tests.unit.test_tool_selection
+python -m tests.unit.test_drafts
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
@@ -167,7 +172,7 @@ regardless of cwd, so the console script runs the main checkout no matter where 
 For that, `cd` into the worktree and use
 `python -c "from exchange_mcp.server import main; main()" --transport http --port <port>` —
 `python -c` puts cwd first on `sys.path`, and importing `exchange_mcp.server` by its real name
-keeps the single `MCPServer` instance. Verify with a `list_tools` count of 63 before trusting a run.
+keeps the single `MCPServer` instance. Verify with a `list_tools` count of 65 before trusting a run.
 
 There is no credential setup step and no login CLI: the first start opens a browser
 window and you sign in there. See "Authentication" below.
@@ -383,7 +388,7 @@ thread that process exit kills outright.
 [PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
 - **ID column and numbering rule**: every tool row's first column is a permanent ID of the form `<module number><2-digit sequence within that module>` — 3 digits for the single-digit modules, 4 from module 10 onward (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module; `1003` = module 10 (Tasks), 3rd tool there). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks, 11 Discovery — a brand-new module gets the next unused module number, never a reused or renumbered one, so once the single digits ran out (Tasks, 2026-09-11) the module part grew a digit rather than colliding. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "63 tools" totals here and in README.md).
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "65 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.

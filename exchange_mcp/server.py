@@ -24,6 +24,7 @@ from exchange_mcp import auth_errors
 from exchange_mcp import hot_reload
 from exchange_mcp import mailbox_timezone
 from exchange_mcp import profile_lock
+from exchange_mcp import tool_selection
 from exchange_mcp import __version__
 from exchange_mcp.browser_session import BrowserSession, ProfileLockedError, is_source_checkout
 from exchange_mcp.owa_client import OWAClient
@@ -363,6 +364,30 @@ KNOWN_BUGGY_TOOLS: dict[str, str] = {}
 
 _stable_mode_active = False
 
+# EXCHANGE_MCP_TOOLS / --tools, once applied. Kept so dev_reload_tool_modules
+# can re-apply it: a reload re-registers every tool in the module.
+_tool_allowlist: frozenset[str] | None = None
+
+
+def _apply_tool_allowlist(raw: str) -> None:
+    """Reduce the MCP tool listing to an operator-chosen subset (see tool_selection.py)."""
+    global _tool_allowlist
+    allowlist = tool_selection.parse_tool_allowlist(raw)
+    if allowlist is None:
+        return
+    _tool_allowlist = allowlist
+    result = tool_selection.apply_tool_allowlist(mcp, allowlist)
+    source = ("EXCHANGE_MCP_TOOLS / --tools" if (raw or "").strip()
+              else f"the default selection '{tool_selection.DEFAULT_SELECTION}' "
+                   f"(set EXCHANGE_MCP_TOOLS={tool_selection.ALL} for every tool)")
+    _log(f"Tools:       {len(result['kept'])} of {len(result['kept']) + len(result['excluded'])} "
+         f"enabled by {source}")
+    if result["unknown"]:
+        _log(f"  WARNING: no such tool(s), check for typos: {', '.join(result['unknown'])}")
+    if result["missing_sign_in"]:
+        _log(f"  WARNING: {', '.join(result['missing_sign_in'])} not enabled - an expired "
+             "session can then only be fixed by restarting the server")
+
 
 def _apply_stable_mode() -> None:
     """Remove known-buggy tools from the MCP tool listing so --stable clients can't call them."""
@@ -386,6 +411,7 @@ async def dev_reload_tool_modules(modules: list[str] | None = None, ctx: Context
     """
     result = hot_reload.reload_modules(
         mcp, modules, stable_mode_active=_stable_mode_active, known_buggy_tools=KNOWN_BUGGY_TOOLS,
+        tool_allowlist=_tool_allowlist,
     )
     if result["changed"] and ctx is not None:
         await ctx.notify_tools_changed()
@@ -436,10 +462,21 @@ def main():
              "exchange_mcp/tools/*.py in-process without restarting this server. "
              "Off by default — dev-only, not for a shared prod instance.",
     )
+    parser.add_argument(
+        "--tools",
+        default=os.environ.get("EXCHANGE_MCP_TOOLS", ""),
+        help="Comma-separated tool names and/or presets to expose ("
+             + ", ".join(sorted(tool_selection.PRESETS)) + f", or '{tool_selection.ALL}'). "
+             f"Unset or empty uses the default ('{tool_selection.DEFAULT_SELECTION}').",
+    )
     args = parser.parse_args()
 
     if args.stable:
         _apply_stable_mode()
+
+    # Before dev_reload_tool_modules is added: that one is an operator utility
+    # switched on by its own flag, not a mailbox tool an allowlist should hide.
+    _apply_tool_allowlist(args.tools)
 
     if args.dev_reload:
         mcp.add_tool(dev_reload_tool_modules)

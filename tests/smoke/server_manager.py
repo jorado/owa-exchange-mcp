@@ -296,7 +296,10 @@ def _start_detached() -> None:
         # `-c` with a canonical import gets both right: cwd (REPO_ROOT, below)
         # is sys.path[0], and the module is imported once under its real name.
         [sys.executable, "-c", "from exchange_mcp.server import main; main()",
-         "--transport", "http", "--port", str(PORT), "--show-browser"],
+         "--transport", "http", "--port", str(PORT), "--show-browser",
+         # Every suite needs its own tools present whatever this shell's
+         # EXCHANGE_MCP_TOOLS (or the build's default selection) says.
+         "--tools", "all"],
         cwd=str(REPO_ROOT),
         stdout=log,
         stderr=subprocess.STDOUT,

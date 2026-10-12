@@ -89,6 +89,7 @@ the process must already be listening before a client tries to connect.
 | `EXCHANGE_MCP_HOST` | No | Bind host for `--transport http` (default `127.0.0.1` — keep it on loopback, see [Security](#security)) |
 | `EXCHANGE_MCP_PORT` | No | Bind port for `--transport http` (default `8765`) |
 | `EXCHANGE_MCP_STABLE` | No | Set to `true`/`1`/`yes` to exclude known-buggy tools from the MCP tool listing (same effect as `--stable`) |
+| `EXCHANGE_MCP_TOOLS` | No | Comma-separated tool names and/or presets to expose, e.g. `read-drafts` (read mail/calendar/directory, write drafts, never send) or `all`; unset exposes all (same effect as `--tools`) |
 | `EXCHANGE_TIMEZONE` | No | Your mailbox's timezone, as a Windows id (`W. Europe Standard Time`) or an IANA one (`Europe/Rome`). Used to line free/busy times up with the working hours `find_free_time`/`find_meeting_time` search in. Unset, the mailbox's own zone is used where it can be read; if it can't be, times are left in UTC and the response says so |
 | `EXCHANGE_DISCOVERY_DIR` | No | Where capability-discovery captures are written (default: `<repo>/.discovery-sessions` in a source checkout, `~/owa-mcp/discovery-sessions` otherwise) |
 
@@ -198,9 +199,9 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (63)
+## Tools (65)
 
-### Email (18)
+### Email (20)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
@@ -211,6 +212,8 @@ accidentally denied push is something you just retry there.
 | `send_email` | Send a new email |
 | `reply_email` | Reply to an email |
 | `forward_email` | Forward an email |
+| `create_draft` | Save a new email to Drafts without sending it |
+| `create_reply_draft` | Save a reply / reply-all / forward to Drafts without sending it |
 | `delete_email` | Delete an email |
 | `move_email` | Move email to another folder (by folder id, `/`-path, or display name) |
 | `mark_email_read` | Mark email as read/unread |

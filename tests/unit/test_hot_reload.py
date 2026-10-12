@@ -256,6 +256,48 @@ def test_stable_mode_reexcludes_buggy_tool() -> None:
             sys.modules.pop("hr_fixture_shared", None)
 
 
+def test_allowlist_reexcludes_hidden_tool() -> None:
+    print("tool_allowlist strips a tool the operator hid back out after reload")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        sys.path.insert(0, tmp)
+        try:
+            _make_shared(tmp_path)
+            mcp = _load_shared_mcp(tmp_path)
+            fx = _FixtureModule(tmp_path, mcp, "hr_fixture_d")
+            fx.write(
+                "from hr_fixture_shared import mcp\n"
+                "@mcp.tool()\n"
+                "def read_tool() -> str:\n"
+                "    return 'read'\n"
+                "@mcp.tool()\n"
+                "def send_tool() -> str:\n"
+                "    return 'send'\n"
+            )
+            fx.import_fresh()
+            mcp.remove_tool("send_tool")  # what startup's allowlist did
+
+            result = hot_reload.reload_modules(
+                mcp,
+                ["fixture_d"],
+                module_aliases={"fixture_d": "hr_fixture_d"},
+                tool_allowlist=frozenset({"read_tool"}),
+            )
+
+            mod_result = result["modules"]["hr_fixture_d"]
+            check("reload status ok", mod_result["status"] == "ok", repr(mod_result))
+            check("send_tool reported as allowlist_excluded",
+                  mod_result["allowlist_excluded"] == ["send_tool"], repr(mod_result))
+            check("send_tool not reported as added", "send_tool" not in mod_result["added"], repr(mod_result))
+            names_after = {t.name for t in mcp._tool_manager.list_tools()}
+            check("send_tool is not registered after reload", "send_tool" not in names_after, names_after)
+            check("read_tool is still registered", "read_tool" in names_after, names_after)
+            fx.close()
+        finally:
+            sys.path.remove(tmp)
+            sys.modules.pop("hr_fixture_shared", None)
+
+
 # ------------------------------------------------------------------
 # A disallowed module name is rejected, never imported
 # ------------------------------------------------------------------
@@ -279,6 +321,7 @@ def main() -> bool:
         test_successful_reload_swaps_behavior,
         test_broken_reload_rolls_back,
         test_stable_mode_reexcludes_buggy_tool,
+        test_allowlist_reexcludes_hidden_tool,
         test_disallowed_module_is_rejected,
     ):
         test()

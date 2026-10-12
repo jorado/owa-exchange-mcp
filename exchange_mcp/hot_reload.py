@@ -90,6 +90,7 @@ def _reload_one(
     *,
     stable_mode_active: bool,
     known_buggy_tools: dict[str, str],
+    tool_allowlist: "frozenset[str] | None" = None,
 ) -> dict[str, Any]:
     before = _tools_of_module(mcp, dotted_name)
     _remove_tools(mcp, list(before.keys()))
@@ -127,6 +128,17 @@ def _reload_one(
                 del after[name]
                 stable_excluded.append(name)
 
+    # Same reasoning as --stable above: the allowlist is applied once at
+    # startup, and a reload re-runs every @mcp.tool() in the module, so without
+    # this a reload would quietly re-expose tools the operator chose to hide.
+    allowlist_excluded: list[str] = []
+    if tool_allowlist is not None:
+        for name in list(after.keys()):
+            if name not in tool_allowlist:
+                mcp.remove_tool(name)
+                del after[name]
+                allowlist_excluded.append(name)
+
     added = sorted(after.keys() - before.keys())
     removed = sorted(before.keys() - after.keys())
     updated = sorted(
@@ -140,6 +152,7 @@ def _reload_one(
         "removed": removed,
         "updated": updated,
         "stable_excluded": stable_excluded,
+        "allowlist_excluded": sorted(allowlist_excluded),
     }
 
 
@@ -150,6 +163,7 @@ def reload_modules(
     stable_mode_active: bool = False,
     known_buggy_tools: "dict[str, str] | None" = None,
     module_aliases: "dict[str, str] | None" = None,
+    tool_allowlist: "frozenset[str] | None" = None,
 ) -> dict[str, Any]:
     """Reload one or more tool modules on a live `MCPServer`.
 
@@ -173,6 +187,7 @@ def reload_modules(
             dotted_name,
             stable_mode_active=stable_mode_active,
             known_buggy_tools=known_buggy_tools,
+            tool_allowlist=tool_allowlist,
         )
         modules[dotted_name] = result
         if result["status"] in ("ok", "loaded") and (

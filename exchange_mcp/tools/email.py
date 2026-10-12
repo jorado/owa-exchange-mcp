@@ -2290,6 +2290,186 @@ def forward_email(
         return json.dumps({"error": f"Failed to forward email: {e}"})
 
 
+# ---------------------------------------------------------------------------
+# Drafts: the same CreateItem shapes as send/reply/forward above, but saved,
+# never sent. They exist so a deployment can offer "write mail" without
+# "send mail" (EXCHANGE_MCP_TOOLS): a human reviews and sends from OWA. That
+# guarantee is the whole value, so the disposition is a constant the builders
+# own - not a parameter a caller (or a later refactor) could flip to Send*.
+# ---------------------------------------------------------------------------
+
+_DRAFT_DISPOSITION = "SaveOnly"
+
+_REPLY_DRAFT_TYPES = {
+    "reply": "ReplyToItem:#Exchange",
+    "reply_all": "ReplyAllToItem:#Exchange",
+    "forward": "ForwardItem:#Exchange",
+}
+
+
+def _body_content(body: str, is_html: bool) -> dict:
+    return {
+        "__type": "BodyContentType:#Exchange",
+        "BodyType": "HTML" if is_html else "Text",
+        "Value": body,
+    }
+
+
+def _save_draft_payload(client: OWAClient, item: dict) -> dict:
+    return {
+        "__type": "CreateItemJsonRequest:#Exchange",
+        # No timestamps anywhere in a draft, so no TimeZoneContext (and no
+        # configuration probe to resolve one).
+        "Header": client.request_header("V2017_08_18", with_timezone=False),
+        "Body": {
+            "__type": "CreateItemRequest:#Exchange",
+            "Items": [item],
+            "MessageDisposition": _DRAFT_DISPOSITION,
+            "SavedItemFolderId": {
+                "__type": "TargetFolderId:#Exchange",
+                "BaseFolderId": OWAClient.folder_id_dict("drafts"),
+            },
+        },
+    }
+
+
+def _new_draft_item(to: str, subject: str, body: str, cc: str, bcc: str,
+                    importance: str, is_html: bool) -> dict:
+    message = {
+        "__type": "Message:#Exchange",
+        "Subject": subject,
+        "Body": _body_content(body, is_html),
+        "Importance": importance,
+    }
+    # Unlike send_email, no recipient is required: a draft without one is a
+    # perfectly normal thing to hand a human to finish.
+    for field, value in (("ToRecipients", to), ("CcRecipients", cc), ("BccRecipients", bcc)):
+        recipients = _build_recipient_list(value) if value else []
+        if recipients:
+            message[field] = recipients
+    return message
+
+
+def _reply_draft_item(mode: str, item_id: str, change_key: str, body: str,
+                      to: str, is_html: bool) -> dict:
+    item = {
+        "__type": _REPLY_DRAFT_TYPES[mode],
+        "ReferenceItemId": {"__type": "ItemId:#Exchange", "Id": item_id, "ChangeKey": change_key},
+    }
+    if body:
+        item["NewBodyContent"] = _body_content(body, is_html)
+    if to:
+        item["ToRecipients"] = _build_recipient_list(to)
+    return item
+
+
+def _saved_draft_result(client: OWAClient, data: dict, what: str) -> str:
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            return json.dumps({
+                "error": msg.get("MessageText", f"Failed to save {what}."),
+                "response_code": msg.get("ResponseCode", ""),
+            })
+        for item in msg.get("Items", []):
+            return json.dumps({
+                "success": True,
+                "item_id": item.get("ItemId", {}).get("Id", ""),
+                "folder": "drafts",
+                "message": f"{what.capitalize()} saved to Drafts. It has NOT been sent.",
+            })
+    return json.dumps({
+        "success": True,
+        "item_id": "",
+        "folder": "drafts",
+        "message": f"{what.capitalize()} saved to Drafts. It has NOT been sent.",
+    })
+
+
+@mcp.tool()
+def create_draft(
+    subject: str,
+    body: str,
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    importance: str = "Normal",
+    is_html: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Save a new email as a draft in the Drafts folder. Never sends it.
+
+    The user reviews and sends the draft themselves (e.g. in OWA). Use
+    find_person to look up recipient addresses.
+
+    Args:
+        subject: Email subject line.
+        body: Email body text.
+        to: Comma-separated recipient addresses (optional for a draft).
+        cc: Comma-separated CC recipients (optional).
+        bcc: Comma-separated BCC recipients (optional).
+        importance: Low, Normal, or High (default Normal).
+        is_html: If True, body is treated as HTML. Otherwise plain text.
+
+    Returns:
+        JSON with `success`, the draft's `item_id` (for get_email /
+        get_email_links), and `folder: "drafts"`.
+    """
+    try:
+        client = _get_client(ctx)
+        item = _new_draft_item(to, subject, body, cc, bcc, importance, is_html)
+        data = client.request("CreateItem", _save_draft_payload(client, item))
+        return _saved_draft_result(client, data, "draft")
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to save draft: {e}"})
+
+
+@mcp.tool()
+def create_reply_draft(
+    item_id: str,
+    body: str,
+    mode: str = "reply",
+    to: str = "",
+    is_html: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Save a reply, reply-all or forward of an email as a draft. Never sends it.
+
+    Exchange fills in the recipients, the "RE:"/"FW:" subject and the quoted
+    original, exactly as OWA's own Reply button does; `body` is the new text
+    above the quote. The draft lands in the Drafts folder for the user to
+    review and send.
+
+    Args:
+        item_id: The Exchange ItemId of the email to respond to.
+        body: New text placed above the quoted original.
+        mode: "reply" (sender only, default), "reply_all", or "forward".
+        to: Comma-separated recipients. Required for "forward"; for a reply
+            it adds recipients to the ones Exchange fills in.
+        is_html: If True, body is treated as HTML. Otherwise plain text.
+
+    Returns:
+        JSON with `success`, the draft's `item_id`, and `folder: "drafts"`.
+    """
+    if mode not in _REPLY_DRAFT_TYPES:
+        return json.dumps({"error": f"mode must be one of {sorted(_REPLY_DRAFT_TYPES)}, got {mode!r}."})
+    if mode == "forward" and not _build_recipient_list(to):
+        return json.dumps({"error": "A forward draft needs at least one recipient in `to`."})
+    try:
+        client = _get_client(ctx)
+        change_key = _get_change_key(client, item_id)
+        if not change_key:
+            return json.dumps({"error": "Could not resolve item ChangeKey."})
+        item = _reply_draft_item(mode, item_id, change_key, body, to, is_html)
+        data = client.request("CreateItem", _save_draft_payload(client, item))
+        return _saved_draft_result(client, data, f"{mode.replace('_', '-')} draft")
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to save reply draft: {e}"})
+
+
 @mcp.tool()
 def mark_email_read(
     item_ids: list[str],
